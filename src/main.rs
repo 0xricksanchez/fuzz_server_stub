@@ -97,9 +97,8 @@ async fn handle_client(stream: &mut TcpStream,  addr: &SocketAddr,  message_queu
     let dstr = String::from_utf8_lossy(&tc.data);
     println!("> Peer: {addr} | Ver: {} | data length: {} | Data: {:?}",  tc.version, tc.length, dstr);
     buf.clear();
-    let queue_length = msg_lock.messages.len();
-    println!("queue_length: {}", queue_length);
-
+    //let queue_length = msg_lock.messages.len();
+    //println!("queue_length: {}", queue_length);
     Ok(())
 }
 
@@ -134,7 +133,7 @@ async fn worker(socket: &mut TcpStream, addr: &SocketAddr, message_queue: &Arc<M
             for (idx, message) in msg_lock.messages.clone().iter().enumerate() {
                 if message.sender != *addr {
                     let serialized_pkt: Vec<u8> = (&message.content).into();
-                    println!("Sending {} -> {}: {:?}", message.sender, addr, serialized_pkt);
+                    //println!("Sending {} -> {}: {:?}", message.sender, addr, serialized_pkt);
                     let _ = socket.write_all(&serialized_pkt).await;
                     idx_vec.push(idx);
                 }
