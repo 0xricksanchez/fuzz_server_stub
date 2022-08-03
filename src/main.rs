@@ -94,7 +94,6 @@ async fn get_fuzzpkt_from_payload(stream: &mut TcpStream, addr: &SocketAddr) -> 
 
     let tc = FuzzPacket::from(&buf);
 
-
     let dstr = String::from_utf8_lossy(&tc.data);
     println!("> Peer: {} | Ver: {} | data length: {} | Data: {:?}", addr, tc.version, tc.length, dstr);
     buf.clear();
