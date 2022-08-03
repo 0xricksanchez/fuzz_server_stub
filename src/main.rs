@@ -1,9 +1,9 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -15,6 +15,8 @@ pub enum Error {
     DroppedConnection,
 
     NoIndex,
+
+    ReadingPayload,
 }
 
 /// Keep track of incoming clients
@@ -28,6 +30,7 @@ struct Connections {
 struct Message {
     sender: SocketAddr,
     content: FuzzPacket,
+    seen_by: Vec<IpAddr>,
 }
 
 /// Stash every message in here and mimic a queue behavior
@@ -75,31 +78,27 @@ impl From<&FuzzPacket> for Vec<u8> {
         }
         s
     }
-
 }
 
 /// Handle incoming connections
 /// Print the deserialized test case
 /// Add sender and its message to the message queue
-async fn handle_client(stream: &mut TcpStream,  addr: &SocketAddr,  message_queue: &Arc<Mutex<MessageQueue>>) -> Result<()> {
-    let mut msg_lock = message_queue.lock().await;
+async fn get_fuzzpkt_from_payload(stream: &mut TcpStream, addr: &SocketAddr) -> Result<FuzzPacket> {
     let mut buf = vec![0; 512];
-    let _ret = stream.read(&mut buf).await.expect("Reading into buf");
-    if buf.clone().into_iter().all(|b| b == 0) || !buf.starts_with(&[42]) {
+    // FIXME: This seems to fail in some cases as it's not pulling all the data from the stream -> causing
+    // the data to be all '\0'...
+    let _ret = stream.read(&mut buf).await.map_err(|_| Error::ReadingPayload)?;
+    if buf.iter().all(|b| *b == 0) || !buf.starts_with(&[42]) {
         return Err(Error::DroppedConnection);
     }
 
     let tc = FuzzPacket::from(&buf);
-    msg_lock.messages.push(Message {
-        sender: *addr,
-        content: tc.clone(),
-    });
+
+
     let dstr = String::from_utf8_lossy(&tc.data);
-    println!("> Peer: {addr} | Ver: {} | data length: {} | Data: {:?}",  tc.version, tc.length, dstr);
+    println!("> Peer: {} | Ver: {} | data length: {} | Data: {:?}", addr, tc.version, tc.length, dstr);
     buf.clear();
-    //let queue_length = msg_lock.messages.len();
-    //println!("queue_length: {}", queue_length);
-    Ok(())
+    Ok(tc)
 }
 
 /// Drop client from client list
@@ -121,33 +120,62 @@ async fn worker(socket: &mut TcpStream, addr: &SocketAddr, message_queue: &Arc<M
     let message_queue = Arc::clone(message_queue);
     let connections = Arc::clone(connections);
     loop {
-        // If an error occurs during client handling we just drop them
-        if handle_client(socket, addr, &message_queue).await.is_err() {
+        // Grab a `FuzzPacket` if possible...
+        if let Ok(fuzz_pkt) = get_fuzzpkt_from_payload(socket, addr).await {
+            let con_lock = connections.lock().await;
+            let con_len = con_lock.clients.len();
+            drop(con_lock);
+            // If we have at least another client add it to the message_queue so it can be forwarded
+            if con_len > 1 {
+                let mut msg_lock = message_queue.lock().await;
+                msg_lock.messages.push(Message {
+                    sender: *addr,
+                    content: fuzz_pkt,
+                    seen_by: Vec::new(),
+                });
+                drop(msg_lock);
+            }
+        } else {
+            // If an error occurs during client handling we just drop them
             let _ret = handle_client_drop(addr, &connections).await;
             break;
         }
+
         // Attempt to consume the message queue if not empty
         let mut msg_lock = message_queue.lock().await;
         if !msg_lock.messages.is_empty() {
-            let mut idx_vec: Vec<usize> = Vec::new();
-            for (idx, message) in msg_lock.messages.clone().iter().enumerate() {
-                if message.sender != *addr {
-                    let serialized_pkt: Vec<u8> = (&message.content).into();
-                    //println!("Sending {} -> {}: {:?}", message.sender, addr, serialized_pkt);
-                    let _ = socket.write_all(&serialized_pkt).await;
-                    idx_vec.push(idx);
-                }
-            }
-            idx_vec.reverse();
-            for entry in idx_vec {
-                msg_lock.messages.remove(entry);
-            }
+            let mut idx_vec = handle_msg_fwd(socket, addr, &connections, &mut msg_lock).await?;
+            rm_seen_msgs(&mut msg_lock, &mut idx_vec);
             drop(msg_lock);
         } else {
-            continue
+            continue;
         }
     }
     Ok(())
+}
+
+fn rm_seen_msgs(msg_lock: &mut MutexGuard<MessageQueue>, idx_vec: &mut Vec<usize>) {
+    idx_vec.reverse();
+    for e in idx_vec {
+        msg_lock.messages.remove(*e);
+    }
+}
+
+async fn handle_msg_fwd(socket: &mut TcpStream, addr: &SocketAddr, connections: &Arc<Mutex<Connections>>, msg_lock: &mut MutexGuard<'_, MessageQueue>) -> Result<Vec<usize>> {
+    let mut idx_vec: Vec<usize> = Vec::new();
+    for (idx, message) in msg_lock.messages.iter_mut().enumerate() {
+        if message.sender != *addr && !message.seen_by.contains(&addr.ip()) {
+            let serialized_pkt: Vec<u8> = (&message.content).into();
+            let _ = socket.write_all(&serialized_pkt).await;
+            message.seen_by.push(addr.ip());
+            let con_lock = connections.lock().await;
+            let con_ipaddr = con_lock.clients.iter().map(|x| x.ip()).collect::<Vec<IpAddr>>();
+            if message.seen_by.iter().all(|item| con_ipaddr.contains(item)) {
+                idx_vec.push(idx);
+            }
+        }
+    }
+    Ok(idx_vec)
 }
 
 
